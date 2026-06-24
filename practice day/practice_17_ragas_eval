@@ -1,0 +1,320 @@
+"""
+practice_17_manual_eval.py
+Goal: implement RAGAS metrics manually using Groq directly.
+No external eval library — just prompt engineering.
+
+Faithfulness:      does the answer contain only claims from the context?
+Answer relevancy:  does the answer actually address the question?
+Context precision: are the retrieved chunks relevant to the question?
+Context recall:    does the context contain enough to answer the question?
+"""
+
+import json
+import re
+import numpy as np
+from pathlib import Path
+from pypdf import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+from groq import Groq
+from dotenv import load_dotenv
+import chromadb
+
+load_dotenv()
+
+
+# ── Pipeline helpers ──────────────────────────────────────────────
+
+def load_and_clean_pdf(filepath: Path) -> str:
+    reader = PdfReader(str(filepath))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+    raw = "\n".join(pages)
+    cleaned = re.sub(r"[ \t\n]+", " ", raw)
+    cleaned = cleaned.replace("ﬁ", "fi").replace("ﬂ", "fl")
+    return cleaned
+
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=[". ", " ", ""],
+    )
+    return splitter.split_text(text)
+
+
+def retrieve(query: str, collection, embed_model, k: int = 3) -> list[str]:
+    query_emb = embed_model.encode([query])
+    results = collection.query(
+        query_embeddings=query_emb.tolist(),
+        n_results=k,
+    )
+    return results["documents"][0]
+
+
+def generate(query: str, chunks: list[str], groq_client: Groq) -> str:
+    context = "\n\n".join([f"[chunk {i+1}]: {chunk}"
+                            for i, chunk in enumerate(chunks)])
+    system_prompt = """You are a research assistant.
+Answer the question using ONLY the context provided below.
+If context is insufficient say: 'I don't have enough context to answer this.'
+Do not use outside knowledge.
+
+Context:
+{context}""".format(context=context)
+
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query},
+        ]
+    )
+    return response.choices[0].message.content
+
+
+# ── RAGAS metrics implemented manually ───────────────────────────
+
+def score_faithfulness(question: str, answer: str,
+                       contexts: list[str], groq_client: Groq) -> float:
+    """
+    Ask LLM: does the answer contain ONLY claims supported by the context?
+    Returns a score from 0.0 to 1.0.
+    0.0 = answer is full of unsupported claims (hallucination)
+    1.0 = every claim in the answer is grounded in the context
+    """
+    context_text = "\n\n".join(contexts)
+    prompt = f"""You are an evaluation assistant.
+
+Question: {question}
+Answer: {answer}
+Context: {context_text}
+
+Task: Check if every claim in the Answer is supported by the Context.
+Return ONLY a JSON object with this exact format:
+{{"supported_claims": 3, "total_claims": 4, "score": 0.75}}
+
+Where:
+- total_claims = number of distinct factual claims in the answer
+- supported_claims = how many of those claims are backed by the context
+- score = supported_claims / total_claims
+
+Return ONLY the JSON, no other text."""
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.strip()
+    try:
+        # Strip markdown code fences if present
+        raw = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
+        return float(data["score"])
+    except:
+        return 0.0
+
+
+def score_answer_relevancy(question: str, answer: str,
+                           groq_client: Groq) -> float:
+    """
+    Ask LLM: does the answer actually address the question?
+    Returns 0.0 to 1.0.
+    0.0 = answer is completely off-topic
+    1.0 = answer directly and completely addresses the question
+    """
+    prompt = f"""You are an evaluation assistant.
+
+Question: {question}
+Answer: {answer}
+
+Task: Score how well the Answer addresses the Question.
+Return ONLY a JSON object with this exact format:
+{{"reason": "brief reason", "score": 0.85}}
+
+Where score is between 0.0 and 1.0:
+- 1.0 = answer directly and completely addresses the question
+- 0.5 = answer is partially relevant
+- 0.0 = answer is completely off-topic or refuses to answer
+
+Return ONLY the JSON, no other text."""
+
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.strip()
+    try:
+        raw = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
+        return float(data["score"])
+    except:
+        return 0.0
+
+
+def score_context_precision(question: str, contexts: list[str],
+                             groq_client: Groq) -> float:
+    """
+    Ask LLM: of the retrieved chunks, how many are actually relevant?
+    Returns 0.0 to 1.0.
+    0.0 = all retrieved chunks are irrelevant (noisy retrieval)
+    1.0 = every retrieved chunk is relevant to the question
+    """
+    scores = []
+    for chunk in contexts:
+        prompt = f"""You are an evaluation assistant.
+
+Question: {question}
+Chunk: {chunk}
+
+Task: Is this chunk relevant to answering the question?
+Return ONLY a JSON object:
+{{"relevant": true, "score": 1.0}}
+or
+{{"relevant": false, "score": 0.0}}
+
+Return ONLY the JSON, no other text."""
+
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.choices[0].message.content.strip()
+        try:
+            raw = re.sub(r"```json|```", "", raw).strip()
+            data = json.loads(raw)
+            scores.append(float(data["score"]))
+        except:
+            scores.append(0.0)
+
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def score_context_recall(question: str, ground_truth: str,
+                         contexts: list[str], groq_client: Groq) -> float:
+    """
+    Ask LLM: does the retrieved context contain enough to produce the ground truth answer?
+    Returns 0.0 to 1.0.
+    0.0 = context is missing key information needed to answer
+    1.0 = context contains everything needed to produce the ground truth
+    """
+    context_text = "\n\n".join(contexts)
+    prompt = f"""You are an evaluation assistant.
+
+Question: {question}
+Ground truth answer: {ground_truth}
+Retrieved context: {context_text}
+
+Task: Check if the retrieved context contains enough information
+to produce the ground truth answer.
+Return ONLY a JSON object:
+{{"reason": "brief reason", "score": 0.8}}
+
+Where score is between 0.0 and 1.0:
+- 1.0 = context contains all information needed for the ground truth
+- 0.5 = context contains some but not all needed information
+- 0.0 = context is missing most information needed
+
+Return ONLY the JSON, no other text."""
+
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.strip()
+    try:
+        raw = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
+        return float(data["score"])
+    except:
+        return 0.0
+
+
+# ── Main ─────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    groq_client = Groq()
+
+    # Load + chunk + embed + store
+    pdf_path = Path("data/papers/2005.11401v4.pdf")
+    print("Setting up pipeline...")
+    text = load_and_clean_pdf(pdf_path)
+    chunks = chunk_text(text)
+    embeddings = embed_model.encode(chunks)
+
+    client_db = chromadb.PersistentClient(path="./chroma_eval")
+    collection = client_db.get_or_create_collection(
+        name="eval_collection",
+        metadata={"hnsw:space": "cosine"}
+    )
+    collection.upsert(
+        ids=[f"chunk_{i}" for i in range(len(chunks))],
+        documents=chunks,
+        embeddings=embeddings.tolist(),
+    )
+
+    # Load golden dataset
+    with open("data/golden_dataset.json") as f:
+        golden = json.load(f)
+
+    print(f"Evaluating {len(golden)} questions...\n")
+
+    all_scores = {
+        "faithfulness": [],
+        "answer_relevancy": [],
+        "context_precision": [],
+        "context_recall": [],
+    }
+
+    for i, item in enumerate(golden, 1):
+        q = item["question"]
+        gt = item["ground_truth"]
+
+        print(f"[{i}/{len(golden)}] {q[:55]}...")
+
+        retrieved = retrieve(q, collection, embed_model, k=3)
+        answer = generate(q, retrieved, groq_client)
+
+        f_score  = score_faithfulness(q, answer, retrieved, groq_client)
+        ar_score = score_answer_relevancy(q, answer, groq_client)
+        cp_score = score_context_precision(q, retrieved, groq_client)
+        cr_score = score_context_recall(q, gt, retrieved, groq_client)
+
+        all_scores["faithfulness"].append(f_score)
+        all_scores["answer_relevancy"].append(ar_score)
+        all_scores["context_precision"].append(cp_score)
+        all_scores["context_recall"].append(cr_score)
+
+        print(f"  F:{f_score:.2f}  AR:{ar_score:.2f}  "
+              f"CP:{cp_score:.2f}  CR:{cr_score:.2f}")
+
+    # Final averaged scores
+    final = {k: sum(v)/len(v) for k, v in all_scores.items()}
+
+    print("\n" + "=" * 60)
+    print("FINAL EVALUATION RESULTS (averaged over 8 questions)")
+    print("=" * 60)
+    print(f"Faithfulness:      {final['faithfulness']:.4f}")
+    print(f"Answer relevancy:  {final['answer_relevancy']:.4f}")
+    print(f"Context precision: {final['context_precision']:.4f}")
+    print(f"Context recall:    {final['context_recall']:.4f}")
+    print("=" * 60)
+
+    weakest  = min(final, key=final.get)
+    strongest = max(final, key=final.get)
+
+    interpretations = {
+        "faithfulness":     "LLM hallucinating — answers go beyond retrieved context",
+        "answer_relevancy": "Answers off-topic — improve generation prompt",
+        "context_precision":"Retrieval noisy — too many irrelevant chunks",
+        "context_recall":   "Retrieval incomplete — missing relevant chunks, increase k",
+    }
+
+    print(f"\nStrongest: {strongest} ({final[strongest]:.4f})")
+    print(f"Weakest:   {weakest} ({final[weakest]:.4f})")
+    print(f"Action:    {interpretations[weakest]}")
