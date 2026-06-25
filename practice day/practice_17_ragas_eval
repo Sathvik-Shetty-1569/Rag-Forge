@@ -68,7 +68,7 @@ Context:
 {context}""".format(context=context)
 
     response = groq_client.chat.completions.create(
-        model="llama3-8b-8192",
+        model="llama-3.1-8b-instant",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": query},
@@ -144,7 +144,7 @@ Where score is between 0.0 and 1.0:
 Return ONLY the JSON, no other text."""
 
     response = groq_client.chat.completions.create(
-        model="llama3-8b-8192",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}]
     )
     raw = response.choices[0].message.content.strip()
@@ -180,7 +180,7 @@ or
 Return ONLY the JSON, no other text."""
 
         response = groq_client.chat.completions.create(
-            model="llama3-8b-8192",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}]
         )
         raw = response.choices[0].message.content.strip()
@@ -222,7 +222,7 @@ Where score is between 0.0 and 1.0:
 Return ONLY the JSON, no other text."""
 
     response = groq_client.chat.completions.create(
-        model="llama3-8b-8192",
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}]
     )
     raw = response.choices[0].message.content.strip()
