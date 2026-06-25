@@ -1,2 +1,7 @@
 venv
 .env
+chroma
+chroma_compression
+chroma_forge
+chroma_eval
+chroma_parent

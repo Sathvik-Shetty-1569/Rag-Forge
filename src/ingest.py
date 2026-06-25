@@ -1,78 +1,145 @@
 """
-ingest.py — loads PDFs, chunks them with multiple strategies, and lets us
-compare chunk quality before committing to one approach.
+ingest.py — RAG-Forge ingestion pipeline
+Loads PDFs, cleans text, chunks, embeds, stores in Chroma.
+Supports multiple papers in one collection.
 """
 
+import re
+import uuid
 from pathlib import Path
 from pypdf import PdfReader
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter,
-    CharacterTextSplitter,
-)
-
-PAPERS_DIR = Path("data/papers")
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+import chromadb
 
 
-def load_pdf_text(filepath: Path) -> str:
-    """Extract raw text from a PDF, page by page."""
+PAPERS_DIR    = Path("data/papers")
+CHROMA_PATH   = Path("./chroma_forge")
+COLLECTION    = "rag_forge"
+EMBED_MODEL   = "all-MiniLM-L6-v2"
+
+# Chunk sizes — small children for retrieval, large parents for generation
+PARENT_SIZE   = 2000
+PARENT_OVERLAP = 100
+CHILD_SIZE    = 200
+CHILD_OVERLAP  = 20
+
+
+def load_and_clean_pdf(filepath: Path) -> str:
     reader = PdfReader(str(filepath))
-    full_text = []
-    for page_num, page in enumerate(reader.pages):
+    pages = []
+    for page in reader.pages:
         text = page.extract_text()
         if text:
-            full_text.append(text)
-    return "\n".join(full_text)
+            pages.append(text)
+    raw = "\n".join(pages)
+    cleaned = re.sub(r"[ \t\n]+", " ", raw)
+    cleaned = cleaned.replace("ﬁ", "fi").replace("ﬂ", "fl")
+    return cleaned
 
 
-def load_all_papers() -> dict[str, str]:
-    """Load every PDF in data/papers/ into {filename: raw_text}."""
-    documents = {}
-    for pdf_file in PAPERS_DIR.glob("*.pdf"):
-        print(f"Loading {pdf_file.name}...")
-        documents[pdf_file.name] = load_pdf_text(pdf_file)
-    return documents
+def is_garbage_chunk(chunk: str) -> bool:
+    """Filter bibliography, headers, and other low-content chunks."""
+    signals = 0
+    if "http://" in chunk or "https://" in chunk:
+        signals += 1
+    citations = re.findall(r'\[\d+\]', chunk)
+    if len(citations) > 6:
+        signals += 1
+    if len(chunk.strip()) < 100:
+        signals += 1
+    return signals >= 2
 
 
-def chunk_fixed_size(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-    """Naive fixed-size character chunking. Fast but ignores structure —
-    will cut mid-sentence, mid-equation, mid-table."""
-    splitter = CharacterTextSplitter(
-        separator="",
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
+def build_parent_child_chunks(text: str):
+    """Split into large parents for generation, small children for retrieval."""
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=PARENT_SIZE,
+        chunk_overlap=PARENT_OVERLAP,
+        separators=[". ", " ", ""],
     )
-    return splitter.split_text(text)
-
-
-def chunk_recursive(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
-    """Recursive splitting — tries paragraph breaks first, then sentences,
-    then words. Respects document structure much better than fixed-size."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHILD_SIZE,
+        chunk_overlap=CHILD_OVERLAP,
+        separators=[". ", " ", ""],
     )
-    return splitter.split_text(text)
+
+    parent_store = {}
+    child_chunks  = []
+
+    for parent_text in parent_splitter.split_text(text):
+        if is_garbage_chunk(parent_text):
+            continue
+        parent_id = str(uuid.uuid4())
+        parent_store[parent_id] = parent_text
+        for child_text in child_splitter.split_text(parent_text):
+            if not is_garbage_chunk(child_text):
+                child_chunks.append({
+                    "text": child_text,
+                    "parent_id": parent_id,
+                })
+
+    return parent_store, child_chunks
+
+
+def get_collection():
+    """Return the Chroma collection (create if not exists)."""
+    client = chromadb.PersistentClient(path=str(CHROMA_PATH))
+    return client.get_or_create_collection(
+        name=COLLECTION,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def ingest_papers(papers_dir: Path = PAPERS_DIR):
+    """
+    Main ingestion function.
+    Loads every PDF in papers_dir, builds parent-child chunks,
+    embeds children, stores in Chroma.
+    Returns parent_store so pipeline can look up full context.
+    """
+    embed_model = SentenceTransformer(EMBED_MODEL)
+    collection  = get_collection()
+
+    all_parent_store = {}
+    all_child_chunks = []
+
+    pdf_files = list(papers_dir.glob("*.pdf"))
+    print(f"Found {len(pdf_files)} papers\n")
+
+    for pdf_path in pdf_files:
+        print(f"Ingesting: {pdf_path.name}")
+        text = load_and_clean_pdf(pdf_path)
+        parent_store, child_chunks = build_parent_child_chunks(text)
+
+        print(f"  Parents: {len(parent_store)} | Children: {len(child_chunks)}")
+
+        all_parent_store.update(parent_store)
+        all_child_chunks.extend(child_chunks)
+
+    # Embed all children at once (faster than per-paper)
+    print(f"\nEmbedding {len(all_child_chunks)} child chunks...")
+    child_texts = [c["text"] for c in all_child_chunks]
+    embeddings  = embed_model.encode(child_texts, show_progress_bar=True)
+
+    # Upsert into Chroma
+    print("Storing in Chroma...")
+    collection.upsert(
+        ids        = [f"child_{i}" for i in range(len(all_child_chunks))],
+        documents  = child_texts,
+        embeddings = embeddings.tolist(),
+        metadatas  = [{"parent_id": c["parent_id"]} for c in all_child_chunks],
+    )
+
+    print(f"\nIngestion complete.")
+    print(f"Total parents (full context chunks): {len(all_parent_store)}")
+    print(f"Total children (retrieval chunks):   {len(all_child_chunks)}")
+
+    return all_parent_store
 
 
 if __name__ == "__main__":
-    docs = load_all_papers()
-
-    # Compare both strategies on the first paper
-    sample_name = list(docs.keys())[0]
-    sample_text = docs[sample_name]
-
-    print(f"\n--- Comparing chunking strategies on: {sample_name} ---")
-    print(f"Total chars: {len(sample_text)}")
-
-    fixed_chunks = chunk_fixed_size(sample_text)
-    recursive_chunks = chunk_recursive(sample_text)
-
-    print(f"\nFixed-size chunking: {len(fixed_chunks)} chunks")
-    print(f"Recursive chunking: {len(recursive_chunks)} chunks")
-
-    print("\n--- Sample fixed-size chunk (#5) ---")
-    print(fixed_chunks[5] if len(fixed_chunks) > 5 else fixed_chunks[0])
-
-    print("\n--- Sample recursive chunk (#5) ---")
-    print(recursive_chunks[5] if len(recursive_chunks) > 5 else recursive_chunks[0])
+    parent_store = ingest_papers()
+    print("\nSample parent chunk (first 200 chars):")
+    sample = list(parent_store.values())[0]
+    print(sample[:200])
