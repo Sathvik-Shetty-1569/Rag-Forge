@@ -32,6 +32,7 @@ def split_texting(chunks:str , chunk_size:int = 500, chunk_overlapped:int = 50)-
     chunks = chunk_splitter.split_text(chunks)
     return chunks
 
+
 def query_retrieval(query:str ,collection, model,k):
     query_embedding = model.encode([query])
     
